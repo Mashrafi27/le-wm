@@ -65,6 +65,8 @@ def build_vit_tiny(img_size=224, patch_size=14, embed_dim=192):
         qkv_bias=True,
         add_pooling_layer=False,
     )
+    # Force eager (math) attention — avoids SDPA fused kernels missing on MI300X (gfx942)
+    cfg._attn_implementation = "eager"
     return ViTModel(cfg)
 
 
@@ -173,6 +175,11 @@ def main():
     ap.add_argument("--no-wandb",      action="store_true")
     ap.add_argument("--resume",        default=None)
     args = ap.parse_args()
+
+    # Disable flash/mem-efficient SDPA — MIOpen lacks compiled kernels for MI300X (gfx942)
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
 
     # ── DDP / device setup ─────────────────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
