@@ -37,14 +37,13 @@ echo "GPUs:    $ROCR_VISIBLE_DEVICES"
 echo "Started: $(date)"
 echo ""
 
-python "$LEWM_DIR/train_echo.py" \
+torchrun --nproc_per_node=8 "$LEWM_DIR/train_echo.py" \
     --shard-index   "$ECHOJEPAV2_DIR/evaluation/shard_index_amd.pkl" \
     --train-uuids   "$ECHOJEPAV2_DIR/training/train_dicoms.txt" \
     --holdout-uuids "$ECHOJEPAV2_DIR/training/holdout_dicoms.txt" \
     --output-dir    "$PROJECT/checkpoints/lewm/echo_vitT_100pct" \
-    --devices       cuda:0 cuda:1 cuda:2 cuda:3 cuda:4 cuda:5 cuda:6 cuda:7 \
     --epochs        20 \
-    --batch-size    512 \
+    --batch-size    64 \
     --lr            4e-4 \
     --warmup-epochs 5 \
     --history-size  8 \

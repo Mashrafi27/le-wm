@@ -5,7 +5,7 @@ Dummy zero actions are passed (no real actions available).
 Encoder: ViT-Tiny (192-dim, patch=14, img=224) via HuggingFace.
 Loss: MSE prediction + SIGReg (weight=0.09).
 
-Example:
+Example (single GPU):
   conda activate echojepav2
   cd /home/mashrafimonon/iCardio/LeWorldModel
   python train_echo.py \\
@@ -13,19 +13,27 @@ Example:
     --train-uuids  ../EchoJEPAv2/training/train_dicoms_5pct.txt \\
     --holdout-uuids ../EchoJEPAv2/training/holdout_dicoms.txt \\
     --output-dir  ../checkpoints/lewm/echo_vit_tiny_5pct \\
-    --device cuda:0 \\
+    --devices cuda:0 \\
     --wandb-name lewm-echo-vitT-5pct
+
+Example (multi-GPU via torchrun):
+  torchrun --nproc_per_node=8 train_echo.py \\
+    --shard-index ... --train-uuids ... --output-dir ... --batch-size 64
 """
 
 import argparse
 import math
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, random_split
+from torch.utils.data.distributed import DistributedSampler
 from transformers import ViTConfig, ViTModel
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -86,17 +94,9 @@ def build_model(embed_dim=192, img_size=224, patch_size=14,
                 projector=projector, pred_proj=pred_proj)
 
 
-# ── DataParallel wrapper ───────────────────────────────────────────────────────
+# ── Forward wrapper ────────────────────────────────────────────────────────────
 
 class JEPAWrapper(nn.Module):
-    """Wraps JEPA encode+predict into a single forward() for DataParallel.
-
-    DataParallel splits the batch across GPUs, runs forward() on each, then
-    gathers all outputs back to the master GPU.  SIGReg is called outside this
-    wrapper so it always sees the full gathered batch — satisfying the
-    single-GPU statistical requirement without DDP all_gather complexity.
-    """
-
     def __init__(self, jepa, history_size, num_preds):
         super().__init__()
         self.jepa = jepa
@@ -115,17 +115,13 @@ class JEPAWrapper(nn.Module):
 
 # ── Training utilities ─────────────────────────────────────────────────────────
 
-def forward_step(wrapper, sigreg, batch, master_device, sigreg_w):
-    pixels = batch["pixels"].to(master_device)
-    action = torch.nan_to_num(batch["action"].to(master_device), 0.0)
-
-    # DataParallel splits batch across GPUs, gathers outputs on master_device
+def forward_step(wrapper, sigreg, batch, device, sigreg_w):
+    pixels = batch["pixels"].to(device)
+    action = torch.nan_to_num(batch["action"].to(device), 0.0)
     pred_emb, tgt_emb, emb = wrapper(pixels, action)
-
     pred_loss   = (pred_emb - tgt_emb).pow(2).mean()
-    sigreg_loss = sigreg(emb.transpose(0, 1))  # full gathered batch
+    sigreg_loss = sigreg(emb.transpose(0, 1))
     loss        = pred_loss + sigreg_w * sigreg_loss
-
     return loss, pred_loss.detach(), sigreg_loss.detach()
 
 
@@ -146,14 +142,15 @@ def main():
     ap.add_argument("--output-dir",    required=True)
 
     ap.add_argument("--epochs",        type=int,   default=50)
-    ap.add_argument("--batch-size",    type=int,   default=64)
+    ap.add_argument("--batch-size",    type=int,   default=64,
+                    help="Per-GPU batch size")
     ap.add_argument("--lr",            type=float, default=5e-5)
     ap.add_argument("--weight-decay",  type=float, default=1e-3)
     ap.add_argument("--warmup-epochs", type=int,   default=5)
     ap.add_argument("--grad-clip",     type=float, default=1.0)
 
-    ap.add_argument("--devices", nargs="+", default=["cuda:1"],
-                    help="One or two GPU devices, e.g. --devices cuda:1 cuda:3")
+    ap.add_argument("--devices", nargs="+", default=["cuda:0"],
+                    help="Used for single-GPU only; ignored when torchrun sets LOCAL_RANK")
     ap.add_argument("--num-workers",   type=int,   default=6)
     ap.add_argument("--seed",          type=int,   default=42)
     ap.add_argument("--prefetch",      type=int,   default=3)
@@ -177,19 +174,34 @@ def main():
     ap.add_argument("--resume",        default=None)
     args = ap.parse_args()
 
+    # ── DDP / device setup ─────────────────────────────────────────────────────
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    is_ddp     = local_rank >= 0 and world_size > 1
+
+    if is_ddp:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        # Single-GPU path: honour --devices[0]
+        device = torch.device(args.devices[0])
+        local_rank = 0
+
+    is_master = local_rank == 0
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    # Parse devices — first entry is master (where SIGReg and optimizer live)
-    device_strs  = args.devices
-    master_device = torch.device(device_strs[0])
-    device_ids    = [int(d.split(":")[-1]) for d in device_strs] if len(device_strs) > 1 else None
+
     out = Path(args.output_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    if is_master:
+        out.mkdir(parents=True, exist_ok=True)
 
     num_frames = args.history_size + args.num_preds
 
     # ── Dataset ────────────────────────────────────────────────────────────────
-    print("Loading dataset …")
+    if is_master:
+        print("Loading dataset …")
     full_ds = load_echo_dataset(
         shard_index_path=args.shard_index,
         allowed_uuids_path=args.train_uuids,
@@ -202,37 +214,54 @@ def main():
     n_val   = max(1, int(len(full_ds) * (1 - args.train_split)))
     n_train = len(full_ds) - n_val
     train_ds, val_ds = random_split(full_ds, [n_train, n_val], generator=rng)
-    # val set uses center-crop in time
     val_ds.dataset.train = False
+
+    if is_master:
+        print(f"  {len(full_ds):,} DICOMs  train {n_train:,}  val {n_val:,}")
 
     nw = args.num_workers
     pf = args.prefetch if nw > 0 else None
-    # pin_memory=False: ROCm segfaults when pin_memory thread interacts with DataParallel GPU contexts
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=nw, drop_last=True, pin_memory=False,
-                              persistent_workers=nw > 0, prefetch_factor=pf,
-                              generator=rng)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=nw, drop_last=False, pin_memory=False,
-                              persistent_workers=nw > 0, prefetch_factor=pf)
-    print(f"  train {n_train:,}  val {n_val:,}  "
-          f"({len(train_loader)} / {len(val_loader)} batches)")
+
+    train_sampler = DistributedSampler(train_ds, shuffle=True,  seed=args.seed) if is_ddp else None
+    val_sampler   = DistributedSampler(val_ds,   shuffle=False, seed=args.seed) if is_ddp else None
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size,
+        sampler=train_sampler, shuffle=(train_sampler is None),
+        num_workers=nw, drop_last=True, pin_memory=False,
+        persistent_workers=nw > 0, prefetch_factor=pf,
+        generator=(rng if train_sampler is None else None),
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size,
+        sampler=val_sampler, shuffle=False,
+        num_workers=nw, drop_last=False, pin_memory=False,
+        persistent_workers=nw > 0, prefetch_factor=pf,
+    )
+
+    if is_master:
+        print(f"  {len(train_loader)} train batches / {len(val_loader)} val batches per rank")
 
     # ── Model ──────────────────────────────────────────────────────────────────
-    print("Building model …")
+    if is_master:
+        print("Building model …")
     model  = build_model(embed_dim=args.embed_dim, img_size=args.img_size,
                          patch_size=args.patch_size, action_dim=1,
-                         history_size=args.history_size).to(master_device)
+                         history_size=args.history_size).to(device)
     sigreg = SIGReg(knots=args.sigreg_knots,
-                    num_proj=args.sigreg_num_proj).to(master_device)
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  {total_params:,} trainable parameters")
+                    num_proj=args.sigreg_num_proj).to(device)
 
-    # Wrap for DataParallel AFTER counting params (DP adds no new params)
+    if is_master:
+        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  {total_params:,} trainable parameters")
+
     wrapper = JEPAWrapper(model, args.history_size, args.num_preds)
-    if device_ids and len(device_ids) > 1:
-        wrapper = nn.DataParallel(wrapper, device_ids=device_ids)
-        print(f"  DataParallel on GPUs: {device_ids}")
+    if is_ddp:
+        # SyncBatchNorm keeps BN stats consistent across ranks
+        wrapper = nn.SyncBatchNorm.convert_sync_batchnorm(wrapper)
+        wrapper = DDP(wrapper, device_ids=[local_rank])
+        if is_master:
+            print(f"  DDP on {world_size} GPUs")
 
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(sigreg.parameters()),
@@ -241,20 +270,24 @@ def main():
 
     start_epoch = 0
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=master_device, weights_only=False)
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"]
-        print(f"  Resumed from epoch {start_epoch}")
+        if is_master:
+            print(f"  Resumed from epoch {start_epoch}")
 
-    # ── WandB ──────────────────────────────────────────────────────────────────
-    use_wb = _WANDB and not args.no_wandb
+    # ── WandB (master only) ────────────────────────────────────────────────────
+    use_wb = _WANDB and not args.no_wandb and is_master
     if use_wb:
         wandb.init(project=args.wandb_project, name=args.wandb_name,
                    entity=args.wandb_entity, config=vars(args))
 
     # ── Training loop ──────────────────────────────────────────────────────────
     for epoch in range(start_epoch, args.epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         lr = lr_schedule(epoch, args.epochs, args.lr,
                          warmup=args.warmup_epochs)
         for pg in optimizer.param_groups:
@@ -265,9 +298,7 @@ def main():
         t_loss, t_pred, t_sreg = [], [], []
         for step, batch in enumerate(train_loader):
             optimizer.zero_grad()
-            loss, pl, sl = forward_step(
-                wrapper, sigreg, batch, master_device, args.sigreg_weight,
-            )
+            loss, pl, sl = forward_step(wrapper, sigreg, batch, device, args.sigreg_weight)
             loss.backward()
             if args.grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -275,7 +306,7 @@ def main():
             t_loss.append(loss.item())
             t_pred.append(pl.item())
             t_sreg.append(sl.item())
-            if step % 100 == 0:
+            if is_master and step % 100 == 0:
                 print(f"  E{epoch+1:03d}/{args.epochs} "
                       f"[{step:4d}/{len(train_loader)}] "
                       f"loss={loss.item():.4f} "
@@ -288,40 +319,43 @@ def main():
         v_loss, v_pred, v_sreg = [], [], []
         with torch.no_grad():
             for batch in val_loader:
-                loss, pl, sl = forward_step(
-                    wrapper, sigreg, batch, master_device, args.sigreg_weight,
-                )
+                loss, pl, sl = forward_step(wrapper, sigreg, batch, device, args.sigreg_weight)
                 v_loss.append(loss.item())
                 v_pred.append(pl.item())
                 v_sreg.append(sl.item())
 
-        print(f"E{epoch+1:03d} | "
-              f"train loss={np.mean(t_loss):.4f} pred={np.mean(t_pred):.4f} "
-              f"sreg={np.mean(t_sreg):.4f} | "
-              f"val  loss={np.mean(v_loss):.4f} pred={np.mean(v_pred):.4f} "
-              f"sreg={np.mean(v_sreg):.4f}")
+        if is_master:
+            print(f"E{epoch+1:03d} | "
+                  f"train loss={np.mean(t_loss):.4f} pred={np.mean(t_pred):.4f} "
+                  f"sreg={np.mean(t_sreg):.4f} | "
+                  f"val  loss={np.mean(v_loss):.4f} pred={np.mean(v_pred):.4f} "
+                  f"sreg={np.mean(v_sreg):.4f}")
 
-        if use_wb:
-            wandb.log({
-                "train/loss": np.mean(t_loss), "train/pred_loss": np.mean(t_pred),
-                "train/sigreg_loss": np.mean(t_sreg),
-                "val/loss":   np.mean(v_loss), "val/pred_loss":   np.mean(v_pred),
-                "val/sigreg_loss":   np.mean(v_sreg),
-                "lr": lr, "epoch": epoch + 1,
-            })
+            if use_wb:
+                wandb.log({
+                    "train/loss": np.mean(t_loss), "train/pred_loss": np.mean(t_pred),
+                    "train/sigreg_loss": np.mean(t_sreg),
+                    "val/loss":   np.mean(v_loss), "val/pred_loss":   np.mean(v_pred),
+                    "val/sigreg_loss":   np.mean(v_sreg),
+                    "lr": lr, "epoch": epoch + 1,
+                })
 
-        # checkpoint (keep last 2 + latest)
-        ckpt_state = {"epoch": epoch + 1, "model": model.state_dict(),
-                      "optimizer": optimizer.state_dict(), "args": vars(args)}
-        torch.save(ckpt_state, out / f"epoch_{epoch+1:03d}.pt")
-        torch.save(ckpt_state, out / "latest.pt")
-        old = sorted(out.glob("epoch_*.pt"))[:-2]
-        for p in old:
-            p.unlink()
+            # checkpoint (keep last 2 + latest)
+            ckpt_state = {"epoch": epoch + 1, "model": model.state_dict(),
+                          "optimizer": optimizer.state_dict(), "args": vars(args)}
+            torch.save(ckpt_state, out / f"epoch_{epoch+1:03d}.pt")
+            torch.save(ckpt_state, out / "latest.pt")
+            old = sorted(out.glob("epoch_*.pt"))[:-2]
+            for p in old:
+                p.unlink()
 
     if use_wb:
         wandb.finish()
-    print("Done.")
+    if is_master:
+        print("Done.")
+
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
