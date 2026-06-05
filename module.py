@@ -195,7 +195,8 @@ class Embedder(nn.Module):
         mlp_scale=4,
     ):
         super().__init__()
-        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
+        # nn.Linear instead of Conv1d(kernel_size=1) — avoids MIOpen Conv1d failures on AMD MI300X
+        self.patch_embed = nn.Linear(input_dim, smoothed_dim)
         self.embed = nn.Sequential(
             nn.Linear(smoothed_dim, mlp_scale * emb_dim),
             nn.SiLU(),
@@ -207,9 +208,7 @@ class Embedder(nn.Module):
         x: (B, T, D)
         """
         x = x.float()
-        x = x.permute(0, 2, 1)
         x = self.patch_embed(x)
-        x = x.permute(0, 2, 1)
         x = self.embed(x)
         return x
 
