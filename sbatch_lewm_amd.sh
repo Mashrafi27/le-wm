@@ -26,8 +26,9 @@ export MIOPEN_CUSTOM_CACHE_DIR="$HOME/.cache/miopen_cache"
 mkdir -p "$MIOPEN_USER_DB_PATH" "$MIOPEN_CUSTOM_CACHE_DIR"
 mkdir -p "$LEWM_DIR/logs"
 
-# Force implicit GEMM — avoids miopenStatusUnknownError on Conv1d with MI300X
+# ROCm/MI300X workarounds
 export MIOPEN_DEBUG_CONV_IMPLICIT_GEMM=1
+export MIOPEN_DISABLE_FUSING=1
 export PYTORCH_TUNABLEOP_ENABLED=0
 
 echo "Job ID:  $SLURM_JOB_ID"
