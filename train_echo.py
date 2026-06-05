@@ -86,25 +86,44 @@ def build_model(embed_dim=192, img_size=224, patch_size=14,
                 projector=projector, pred_proj=pred_proj)
 
 
+# ── DataParallel wrapper ───────────────────────────────────────────────────────
+
+class JEPAWrapper(nn.Module):
+    """Wraps JEPA encode+predict into a single forward() for DataParallel.
+
+    DataParallel splits the batch across GPUs, runs forward() on each, then
+    gathers all outputs back to the master GPU.  SIGReg is called outside this
+    wrapper so it always sees the full gathered batch — satisfying the
+    single-GPU statistical requirement without DDP all_gather complexity.
+    """
+
+    def __init__(self, jepa, history_size, num_preds):
+        super().__init__()
+        self.jepa = jepa
+        self.hs   = history_size
+        self.np   = num_preds
+
+    def forward(self, pixels, action):
+        info = {"pixels": pixels, "action": action}
+        output   = self.jepa.encode(info)
+        emb      = output["emb"]      # (B, T, D)
+        act_emb  = output["act_emb"]  # (B, T, D)
+        pred_emb = self.jepa.predict(emb[:, :self.hs], act_emb[:, :self.hs])
+        tgt_emb  = emb[:, self.np:]
+        return pred_emb, tgt_emb, emb
+
+
 # ── Training utilities ─────────────────────────────────────────────────────────
 
-def forward_step(model, sigreg, batch, device, history_size, num_preds, sigreg_w):
-    pixels = batch["pixels"].to(device)   # (B, T, C, H, W)
-    action = batch["action"].to(device)   # (B, T, 1)
+def forward_step(wrapper, sigreg, batch, master_device, sigreg_w):
+    pixels = batch["pixels"].to(master_device)
+    action = torch.nan_to_num(batch["action"].to(master_device), 0.0)
 
-    info = {"pixels": pixels, "action": torch.nan_to_num(action, 0.0)}
-    output = model.encode(info)
-
-    emb     = output["emb"]      # (B, T, D)
-    act_emb = output["act_emb"]  # (B, T, D)
-
-    ctx_emb  = emb[:, :history_size]      # (B, H, D)
-    ctx_act  = act_emb[:, :history_size]  # (B, H, D)
-    tgt_emb  = emb[:, num_preds:]         # (B, H, D)  — shifted target
-    pred_emb = model.predict(ctx_emb, ctx_act)  # (B, H, D)
+    # DataParallel splits batch across GPUs, gathers outputs on master_device
+    pred_emb, tgt_emb, emb = wrapper(pixels, action)
 
     pred_loss   = (pred_emb - tgt_emb).pow(2).mean()
-    sigreg_loss = sigreg(emb.transpose(0, 1))  # (T, B, D)
+    sigreg_loss = sigreg(emb.transpose(0, 1))  # full gathered batch
     loss        = pred_loss + sigreg_w * sigreg_loss
 
     return loss, pred_loss.detach(), sigreg_loss.detach()
@@ -133,7 +152,8 @@ def main():
     ap.add_argument("--warmup-epochs", type=int,   default=5)
     ap.add_argument("--grad-clip",     type=float, default=1.0)
 
-    ap.add_argument("--device",        default="cuda:0")
+    ap.add_argument("--devices", nargs="+", default=["cuda:1"],
+                    help="One or two GPU devices, e.g. --devices cuda:1 cuda:3")
     ap.add_argument("--num-workers",   type=int,   default=6)
     ap.add_argument("--seed",          type=int,   default=42)
     ap.add_argument("--prefetch",      type=int,   default=3)
@@ -159,7 +179,10 @@ def main():
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device(args.device)
+    # Parse devices — first entry is master (where SIGReg and optimizer live)
+    device_strs  = args.devices
+    master_device = torch.device(device_strs[0])
+    device_ids    = [int(d.split(":")[-1]) for d in device_strs] if len(device_strs) > 1 else None
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -198,11 +221,17 @@ def main():
     print("Building model …")
     model  = build_model(embed_dim=args.embed_dim, img_size=args.img_size,
                          patch_size=args.patch_size, action_dim=1,
-                         history_size=args.history_size).to(device)
+                         history_size=args.history_size).to(master_device)
     sigreg = SIGReg(knots=args.sigreg_knots,
-                    num_proj=args.sigreg_num_proj).to(device)
+                    num_proj=args.sigreg_num_proj).to(master_device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  {total_params:,} trainable parameters")
+
+    # Wrap for DataParallel AFTER counting params (DP adds no new params)
+    wrapper = JEPAWrapper(model, args.history_size, args.num_preds)
+    if device_ids and len(device_ids) > 1:
+        wrapper = nn.DataParallel(wrapper, device_ids=device_ids)
+        print(f"  DataParallel on GPUs: {device_ids}")
 
     optimizer = torch.optim.AdamW(
         list(model.parameters()) + list(sigreg.parameters()),
@@ -211,7 +240,7 @@ def main():
 
     start_epoch = 0
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        ckpt = torch.load(args.resume, map_location=master_device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"]
@@ -231,13 +260,12 @@ def main():
             pg["lr"] = lr
 
         # train
-        model.train()
+        wrapper.train()
         t_loss, t_pred, t_sreg = [], [], []
         for step, batch in enumerate(train_loader):
             optimizer.zero_grad()
             loss, pl, sl = forward_step(
-                model, sigreg, batch, device,
-                args.history_size, args.num_preds, args.sigreg_weight,
+                wrapper, sigreg, batch, master_device, args.sigreg_weight,
             )
             loss.backward()
             if args.grad_clip > 0:
@@ -255,13 +283,12 @@ def main():
                       f"lr={lr:.2e}", flush=True)
 
         # val
-        model.eval()
+        wrapper.eval()
         v_loss, v_pred, v_sreg = [], [], []
         with torch.no_grad():
             for batch in val_loader:
                 loss, pl, sl = forward_step(
-                    model, sigreg, batch, device,
-                    args.history_size, args.num_preds, args.sigreg_weight,
+                    wrapper, sigreg, batch, master_device, args.sigreg_weight,
                 )
                 v_loss.append(loss.item())
                 v_pred.append(pl.item())

@@ -93,10 +93,13 @@ def load_echo_dataset(
         with open(holdout_uuids_path) as f:
             holdout = {line.strip() for line in f if line.strip()}
 
-    uuids = [u for u in allowed if u not in holdout and u in shard_index]
+    candidates = [u for u in allowed if u not in holdout]
+    uuids = [u for u in candidates if u in shard_index]
+    n_holdout_removed = len(allowed) - len(candidates)
+    n_not_indexed = len(candidates) - len(uuids)
     print(
         f"EchoDataset: {len(uuids):,} DICOMs "
-        f"({len(allowed):,} allowed − {len(holdout):,} holdout − "
-        f"{len(allowed) - len(holdout) - len(uuids):,} not indexed)"
+        f"({len(allowed):,} allowed, {n_holdout_removed:,} removed by holdout, "
+        f"{n_not_indexed:,} not in shard index)"
     )
     return EchoDataset(uuids, shard_index, num_frames=num_frames, img_size=img_size, train=train)
