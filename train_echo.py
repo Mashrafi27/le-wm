@@ -207,12 +207,13 @@ def main():
 
     nw = args.num_workers
     pf = args.prefetch if nw > 0 else None
+    # pin_memory=False: ROCm segfaults when pin_memory thread interacts with DataParallel GPU contexts
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=nw, drop_last=True, pin_memory=True,
+                              num_workers=nw, drop_last=True, pin_memory=False,
                               persistent_workers=nw > 0, prefetch_factor=pf,
                               generator=rng)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
-                              num_workers=nw, drop_last=False, pin_memory=True,
+                              num_workers=nw, drop_last=False, pin_memory=False,
                               persistent_workers=nw > 0, prefetch_factor=pf)
     print(f"  train {n_train:,}  val {n_val:,}  "
           f"({len(train_loader)} / {len(val_loader)} batches)")
